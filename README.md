@@ -60,3 +60,7 @@ DSH 动态 Cordis 插件(Host 半部),注册工具 `clean_workspace`:在每次�
 
 - **v1**:`clean_workspace` 手动清理工具 + `agent/turn-stopping` 自动清理(移入回收区)
 - **v2**:自动清理改双信号触发(`agent/turn-stopping` + `agent/status`→idle,防抖去重、不依赖定时器调度,修复 v1 自动触发未生效问题);新增 `permanent` 配置,支持自动清理永久删除模式
+- **v3**:新增 apply 即时清扫 + 定时兜底(`intervalMinutes`)+ 触发标记 `.ws-cleaner-last-run.json`
+- **v4**:apply 直接触发(不依赖定时器)+ 全阶段诊断
+- **v5(根因修复)**:自动清理不生效的根因是**沙箱策略**——插件用 `policySvc.resolve({})` 拿到默认策略(`workspace-write`,workspaceRoot = DSH 安装目录),对会话工作区的写入/删除全部被拦截;v5 改为经 `agents.currentInitiator()` 取会话 Agent,用其 session 解析**会话级策略**(danger-full-access)并显式传给 shell/fs,同时取真实工作区路径
+- **v6**:修复 `__CLEAN_JSON__` 标记解析正则多写的花括号;端到端实测:apply 清扫自动永久删除测试垃圾(permanent 模式),标记文件完整记录触发源与结果
