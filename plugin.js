@@ -4,22 +4,29 @@
 // 加载方式(DSH 内):
 //   1. cordis_define: code.host = 本文件全部内容(即函数体)
 //   2. cordis_run 运行插件后,会话内即可调用工具 clean_workspace
-// 依赖服务(Host): fs(可选,读配置)、shell(移动/删除)、timer、harness
+// 依赖服务(Host): fs(读配置/写标记)、shell(移动/删除)、timer、sandboxPolicy、
+//      agents/sessions(解析会话工作区与策略)、harness
 //
 // 注意: 本文件不含任何凭据。
 //
-// 版本: v2
+// 版本: v6
 //  - v1: clean_workspace 手动清理工具 + agent/turn-stopping 自动清理(移入回收区)
-//  - v2: 自动清理改双信号触发(agent/turn-stopping + agent/status→idle,5 秒防抖、
-//        不依赖定时器调度,修复上一轮未触发问题);新增 permanent 配置:
-//        .dsh-cleaner.json 的 permanent=true 时自动清理直接永久删除(不进回收区)。
+//  - v2: 双信号触发(turn-stopping + status→idle,防抖)+ permanent 配置
+//  - v3: apply 即时清扫 + 定时兜底(intervalMinutes)+ 触发标记 .ws-cleaner-last-run.json
+//  - v4: apply 直接触发(不依赖定时器)+ 全阶段诊断
+//  - v5: 根因修复——policySvc.resolve({}) 返回默认策略(workspace-write,root=DSH 安装
+//        目录),插件对会话工作区的写入/删除全部被沙箱拦截;改为经
+//        agents.currentInitiator() 取会话 Agent,用其 session 解析会话级策略
+//        (danger-full-access)并显式传给 shell/fs,同时取真实工作区路径
+//  - v6: 修复 __CLEAN_JSON__ 标记解析正则多写的花括号
 //
 // 规则(保守):*.tmp *.temp *.bak *.orig *.old *.dmp *.partial *.crdownload *.pyc
-//      .DS_Store Thumbs.db ~$* __pycache__ 目录,以及超过 ageDays(默认 7 天)的 *.log
-// 永不触碰:.dsh-trash 本身、.git 目录、.dsh-cleaner.json 与 keepPatterns 命中的文件。
+//      .DS_Store Thumbs.db ~$* __pycache__ 目录,超龄 *.log(ageDays,默认 7 天),
+//      会话临时 .gh-*-body.json .plugin-check.js
+// 永不触碰:.git、.dsh-trash、.dsh-cleaner.json、.ws-cleaner-last-run.json、keepPatterns。
 // 配置:工作区根目录可选 .dsh-cleaner.json
 //      { "enabled": true, "permanent": false, "ageDays": 7, "trashKeepDays": 7,
-//        "extraPatterns": ["*.abc"], "keepPatterns": ["*.ps1"] }
+//        "intervalMinutes": 10, "extraPatterns": ["*.abc"], "keepPatterns": ["*.ps1"] }
 
 return {
   name: 'ws-cleaner',
@@ -28,13 +35,44 @@ return {
     const fsSvc = ctx.get('fs');
     const shellSvc = ctx.get('shell');
     const policySvc = ctx.get('sandboxPolicy');
+    const agentsSvc = ctx.get('agents');
+    const sessionsSvc = ctx.get('sessions');
 
-    const DEFAULT_PATTERNS = ['*.tmp', '*.temp', '*.bak', '*.orig', '*.old', '*.dmp', '*.partial', '*.crdownload', '*.pyc', '.DS_Store', 'Thumbs.db'];
+    const DEFAULT_PATTERNS = ['*.tmp', '*.temp', '*.bak', '*.orig', '*.old', '*.dmp', '*.partial', '*.crdownload', '*.pyc', '.DS_Store', 'Thumbs.db', '.gh-*-body.json', '.plugin-check.js'];
 
     function psQuote(s) { return "'" + String(s).replace(/'/g, "''") + "'"; }
 
+    function agentCwd(agent) {
+      try { return agent && agent.session && agent.session.header ? agent.session.header.cwd : null; } catch (e) { return null; }
+    }
+    function initiatorCwd() {
+      if (agentsSvc) {
+        try { const a = agentsSvc.currentInitiator(); const c = agentCwd(a); if (c) return { agent: a, cwd: c }; } catch (e) {}
+        try { const a = agentsSvc.requireInitiator(); const c = agentCwd(a); if (c) return { agent: a, cwd: c }; } catch (e) {}
+      }
+      if (sessionsSvc) {
+        try {
+          const list = sessionsSvc.list();
+          if (list && list.length) {
+            for (let i = 0; i < list.length; i++) {
+              const c = agentCwd({ session: list[i] });
+              if (c) return { agent: null, cwd: c };
+            }
+          }
+        } catch (e) {}
+      }
+      return null;
+    }
+    function standingPolicyFor(agent) {
+      try {
+        return policySvc && typeof policySvc.resolve === 'function'
+          ? policySvc.resolve(agent && agent.session ? { session: agent.session } : {})
+          : null;
+      } catch (e) { return null; }
+    }
+
     async function readConfig(workspace) {
-      const cfg = { enabled: true, permanent: false, ageDays: 7, trashKeepDays: 7, extraPatterns: [], keepPatterns: [] };
+      const cfg = { enabled: true, permanent: false, ageDays: 7, trashKeepDays: 7, intervalMinutes: 10, extraPatterns: [], keepPatterns: [] };
       if (!fsSvc) return cfg;
       try {
         const t = await fsSvc.resolve('.dsh-cleaner.json', { cwd: workspace });
@@ -45,6 +83,7 @@ return {
           if (typeof c.permanent === 'boolean') cfg.permanent = c.permanent;
           if (Number.isFinite(Number(c.ageDays))) cfg.ageDays = Math.max(0, Math.floor(Number(c.ageDays)));
           if (Number.isFinite(Number(c.trashKeepDays))) cfg.trashKeepDays = Math.max(1, Math.floor(Number(c.trashKeepDays)));
+          if (Number.isFinite(Number(c.intervalMinutes))) cfg.intervalMinutes = Math.max(1, Math.floor(Number(c.intervalMinutes)));
           if (Array.isArray(c.extraPatterns)) cfg.extraPatterns = c.extraPatterns.filter(function (x) { return typeof x === 'string'; });
           if (Array.isArray(c.keepPatterns)) cfg.keepPatterns = c.keepPatterns.filter(function (x) { return typeof x === 'string'; });
         }
@@ -74,7 +113,7 @@ return {
         "$all = Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue\n" +
         "foreach ($item in $all) {\n" +
         "  $rel = $item.FullName.Substring($root.Length)\n" +
-        "  if ($item.Name -eq '.git' -or $rel -like '*\\.git\\*' -or $item.Name -eq '.dsh-trash' -or $rel -like '*\\.dsh-trash\\*') { continue }\n" +
+        "  if ($item.Name -eq '.git' -or $rel -like '*\\.git\\*' -or $item.Name -eq '.dsh-trash' -or $rel -like '*\\.dsh-trash\\*' -or $item.Name -eq '.dsh-cleaner.json' -or $item.Name -eq '.ws-cleaner-last-run.json') { continue }\n" +
         "  $keepHit = $false\n" +
         "  foreach ($k in $keepPatterns) { if ($item.Name -like $k) { $keepHit = $true; break } }\n" +
         "  if ($keepHit) { continue }\n" +
@@ -114,9 +153,10 @@ return {
       if (!workspace) { result.errors.push('无法确定工作区路径'); return result; }
       try {
         const spec = shellSvc.resolve({ command: buildScript(workspace, opts), timeoutMs: 180000, stdoutMaxBytes: 400000 });
+        if (opts.standing) spec.sandboxPolicy = opts.standing;
         const res = await shellSvc.run(spec);
         const out = res && res.stdout && typeof res.stdout.text === 'string' ? res.stdout.text : '';
-        const m = out.match(/__CLEAN_JSON__\{(\{.*\})\}/);
+        const m = out.match(/__CLEAN_JSON__(\{.*\})/);
         if (m) {
           const parsed = JSON.parse(m[1]);
           if (parsed.error) result.errors.push(parsed.error);
@@ -130,35 +170,55 @@ return {
       return result;
     }
 
-    // ---- 1. 任务完成后自动清理(双信号 + 防抖) ----
+    // ---- 1. 自动清理(apply 清扫 + 定时兜底 + 事件钩子) ----
     let lastAutoCleanAt = 0;
-    function scheduleAutoClean(agent) {
-      let ws = null;
-      try { ws = agent && agent.session && agent.session.header ? agent.session.header.cwd : null; } catch (e) { ws = null; }
-      if (!ws) return;
+    function scheduleAutoClean(agent, trigger) {
+      const init = initiatorCwd();
+      const ag = agent || (init && init.agent);
+      const ws = agentCwd(ag) || (init && init.cwd) || null;
+      const standing = standingPolicyFor(ag);
+      const diag = { trigger: trigger, time: new Date().toISOString(), ws: ws, hasPolicy: !!policySvc, stage: ws ? 'start' : 'no-workspace' };
+      if (fsSvc && ws) {
+        fsSvc.resolve('.ws-cleaner-last-run.json', { cwd: ws }).then(function (t) {
+          return fsSvc.writeText(t, JSON.stringify(diag), undefined, undefined, standing);
+        }).catch(function () {});
+      }
+      if (!ws) { console.error('ws-cleaner: no workspace for ' + trigger); return; }
       const now = Date.now();
       if (now - lastAutoCleanAt < 5000) return;
       lastAutoCleanAt = now;
       (async () => {
         try {
           const cfg = await readConfig(ws);
-          if (!cfg.enabled) return;
-          const r = await runClean(ws, { dry: false, permanent: cfg.permanent === true, ageDays: cfg.ageDays, trashKeepDays: cfg.trashKeepDays, extraPatterns: cfg.extraPatterns, keepPatterns: cfg.keepPatterns });
-          console.log('ws-cleaner auto: junk=' + r.junk + ' moved=' + r.moved + ' deleted=' + r.deleted + ' purged=' + r.purged + (r.errors.length ? ' errors=' + r.errors.join(';') : ''));
+          if (!cfg.enabled) { diag.stage = 'disabled'; if (fsSvc) { fsSvc.resolve('.ws-cleaner-last-run.json', { cwd: ws }).then(function (t) { return fsSvc.writeText(t, JSON.stringify(diag), undefined, undefined, standing); }).catch(function () {}); } return; }
+          const r = await runClean(ws, { dry: false, permanent: cfg.permanent === true, ageDays: cfg.ageDays, trashKeepDays: cfg.trashKeepDays, extraPatterns: cfg.extraPatterns, keepPatterns: cfg.keepPatterns, standing: standing });
+          diag.stage = 'done'; diag.junk = r.junk; diag.moved = r.moved; diag.deleted = r.deleted; diag.purged = r.purged; diag.errors = r.errors;
+          if (fsSvc) { fsSvc.resolve('.ws-cleaner-last-run.json', { cwd: ws }).then(function (t) { return fsSvc.writeText(t, JSON.stringify(diag), undefined, undefined, standing); }).catch(function () {}); }
+          console.log('ws-cleaner auto [' + trigger + ']: ws=' + ws + ' junk=' + r.junk + ' moved=' + r.moved + ' deleted=' + r.deleted + ' purged=' + r.purged + (r.errors.length ? ' errors=' + r.errors.join(';') : ''));
         } catch (e) {
+          diag.stage = 'error'; diag.error = String(e && e.message ? e.message : e);
+          if (fsSvc && ws) { fsSvc.resolve('.ws-cleaner-last-run.json', { cwd: ws }).then(function (t) { return fsSvc.writeText(t, JSON.stringify(diag), undefined, undefined, standing); }).catch(function () {}); }
           console.error('ws-cleaner auto failed: ' + String(e && e.message ? e.message : e));
         }
       })();
     }
-    ctx.on('agent/turn-stopping', (payload) => scheduleAutoClean(payload && payload.agent));
+    ctx.on('agent/turn-stopping', (payload) => scheduleAutoClean(payload && payload.agent, 'turn-stopping'));
     ctx.on('agent/status', (payload) => {
-      if (payload && payload.status === 'idle') scheduleAutoClean(payload.agent);
+      if (payload && payload.status === 'idle') scheduleAutoClean(payload.agent, 'status-idle');
     });
+    scheduleAutoClean(null, 'apply');
+    (async () => {
+      const init = initiatorCwd();
+      const ws0 = init ? init.cwd : null;
+      const cfg = ws0 ? await readConfig(ws0) : null;
+      const minutes = cfg && Number.isFinite(Number(cfg.intervalMinutes)) && Number(cfg.intervalMinutes) > 0 ? Number(cfg.intervalMinutes) : 10;
+      ctx.interval(() => scheduleAutoClean(null, 'interval'), Math.floor(minutes * 60000));
+    })();
 
     // ---- 2. 手动清理工具 ----
     const tool = harness.defineTool({
       name: 'clean_workspace',
-      description: '清理当前会话工作区里的不必要文件。规则(保守):临时/备份/转储文件(*.tmp *.temp *.bak *.orig *.old *.dmp *.partial *.crdownload *.pyc)、系统残留(.DS_Store Thumbs.db ~$*)、__pycache__ 目录,以及超过 age_days(默认 7 天)未修改的 *.log。默认把命中文件移入工作区 .dsh-trash/<时间戳>/ 回收区(可恢复),并清空超过 trashKeepDays(默认 7 天)的旧回收区;permanent=true 时改为直接永久删除。永不触碰 .git、.dsh-trash 自身与 keep_patterns 命中的文件。自动清理在每次任务回合收尾时按同样规则执行,可用工作区根目录的 .dsh-cleaner.json 配置 {enabled, permanent, ageDays, trashKeepDays, extraPatterns, keepPatterns};permanent=true 时自动清理也直接永久删除(不进回收区)。',
+      description: '清理当前会话工作区里的不必要文件。规则(保守):临时/备份/转储文件(*.tmp *.temp *.bak *.orig *.old *.dmp *.partial *.crdownload *.pyc)、系统残留(.DS_Store Thumbs.db ~$*)、会话临时文件(.gh-*-body.json .plugin-check.js)、__pycache__ 目录,以及超过 age_days(默认 7 天)未修改的 *.log。默认把命中文件移入工作区 .dsh-trash/<时间戳>/ 回收区(可恢复),并清空超过 trashKeepDays(默认 7 天)的旧回收区;permanent=true 时改为直接永久删除。永不触碰 .git、.dsh-trash、.dsh-cleaner.json、.ws-cleaner-last-run.json 与 keep_patterns 命中的文件。自动清理三重保障:插件加载后立即清扫一次 + 每 intervalMinutes(默认 10)分钟定时兜底 + 任务回合收尾事件触发;可用工作区根目录的 .dsh-cleaner.json 配置 {enabled, permanent, ageDays, trashKeepDays, intervalMinutes, extraPatterns, keepPatterns};permanent=true 时自动清理也直接永久删除。每次自动清理后在工作区写 .ws-cleaner-last-run.json 记录触发源与结果。',
       parameters: {
         dry_run: { type: 'boolean', description: '为 true 时只统计命中数量,不移动不删除(默认 false)' },
         permanent: { type: 'boolean', description: '为 true 时直接永久删除,否则移入 .dsh-trash 回收区(默认 false)' },
@@ -197,10 +257,13 @@ return {
       isConcurrencySafe: () => true,
       async execute(args, exec) {
         const agent = exec && exec.agent ? exec.agent : null;
-        let ws = null;
-        try { ws = agent && agent.session && agent.session.header ? agent.session.header.cwd : null; } catch (e) { ws = null; }
-        if (!ws && policySvc && typeof policySvc.workspaceRoot === 'string') ws = policySvc.workspaceRoot;
-        const cfg = ws ? await readConfig(ws) : { enabled: true, permanent: false, ageDays: 7, trashKeepDays: 7, extraPatterns: [], keepPatterns: [] };
+        let ws = agentCwd(agent);
+        if (!ws) {
+          const init = initiatorCwd();
+          ws = init ? init.cwd : null;
+        }
+        const standing = standingPolicyFor(agent);
+        const cfg = ws ? await readConfig(ws) : { enabled: true, permanent: false, ageDays: 7, trashKeepDays: 7, intervalMinutes: 10, extraPatterns: [], keepPatterns: [] };
         const ageDays = args.age_days === undefined ? cfg.ageDays : Number(args.age_days);
         const trashKeepDays = args.trash_keep_days === undefined ? cfg.trashKeepDays : Number(args.trash_keep_days);
         const extraPatterns = Array.isArray(args.extra_patterns) ? args.extra_patterns.filter(function (x) { return typeof x === 'string'; }) : cfg.extraPatterns;
@@ -212,7 +275,8 @@ return {
           trashKeepDays: Number.isFinite(trashKeepDays) ? Math.max(1, Math.floor(trashKeepDays)) : 7,
           purgeTrash: args.purge_trash !== false,
           extraPatterns: extraPatterns,
-          keepPatterns: keepPatterns
+          keepPatterns: keepPatterns,
+          standing: standing
         });
       }
     });
